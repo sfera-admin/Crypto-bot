@@ -1,144 +1,223 @@
-import telebot
-from telebot import types
+# bot.py
 import os
-import ccxt
+import logging
+import asyncio
 import pandas as pd
+import numpy as np
+import ccxt
 import ta
 
-# ========================
-# 🔑 Переменные окружения
-# ========================
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-ADMIN_ID = os.getenv("TELEGRAM_ADMIN_ID")
+from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
-bot = telebot.TeleBot(BOT_TOKEN)
+# ---------- ЛОГИ ----------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# ========================
-# ⚡️ Подключение к Binance
-# ========================
-binance = ccxt.binance()
+# ---------- ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ----------
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")  # обязателен
+# BINANCE ключи не обязательны, ccxt может брать публичные данные
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", None)
+BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", None)
 
-# Доступные пары и таймфреймы
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("TELEGRAM_TOKEN env var is missing")
+
+# ---------- ИНИЦИАЛИЗАЦИЯ BINANCE (ccxt) ----------
+binance = ccxt.binance({
+    "enableRateLimit": True,
+    **({"apiKey": BINANCE_API_KEY, "secret": BINANCE_API_SECRET} if BINANCE_API_KEY else {})
+})
+
+# ---------- Настройки пар и TF ----------
 PAIRS = ["BTC/USDT", "ETH/USDT", "XRP/USDT", "MATIC/USDT", "ADA/USDT", "DOGE/USDT", "SOL/USDT", "TRX/USDT", "SUI/USDT"]
 TIMEFRAMES = ["15m", "30m", "1h", "4h", "1d"]
 
-# Память выбора пользователей
-user_choice = {}
+# Хранилище выбора пользователей (в памяти)
+user_settings = {}  # {chat_id: {"pair": "BTC/USDT", "tf":"1h"}}
 
-# ========================
-# 📊 Функция анализа рынка
-# ========================
-def analyze_symbol(symbol, timeframe):
+
+# ---------- Утилиты: загрузка данных и индикаторы ----------
+def fetch_ohlcv(symbol: str, timeframe: str, limit: int = 200):
+    """
+    Возвращает DataFrame с колонками time, open, high, low, close, volume
+    symbol в формате 'BTC/USDT'
+    """
+    # ccxt требует символ без изменений: 'BTC/USDT'
+    ohlcv = binance.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    df = pd.DataFrame(ohlcv, columns=["time", "open", "high", "low", "close", "volume"])
+    df["close"] = df["close"].astype(float)
+    df["volume"] = df["volume"].astype(float)
+    return df
+
+
+def calculate_indicators(df: pd.DataFrame):
+    # EMA20, EMA50, EMA200
+    df["EMA20"] = df["close"].ewm(span=20, adjust=False).mean()
+    df["EMA50"] = df["close"].ewm(span=50, adjust=False).mean()
+    df["EMA200"] = df["close"].ewm(span=200, adjust=False).mean()
+
+    # RSI 14
+    delta = df["close"].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.rolling(14).mean()
+    avg_loss = loss.rolling(14).mean()
+    rs = avg_gain / avg_loss
+    df["RSI"] = 100 - (100 / (1 + rs))
+
+    # MACD (EMA12 - EMA26) and signal
+    ema12 = df["close"].ewm(span=12, adjust=False).mean()
+    ema26 = df["close"].ewm(span=26, adjust=False).mean()
+    df["MACD"] = ema12 - ema26
+    df["MACD_SIGNAL"] = df["MACD"].ewm(span=9, adjust=False).mean()
+
+    return df
+
+
+def decide_signal(df: pd.DataFrame):
+    last = df.iloc[-1]
+    ema20 = last["EMA20"]
+    ema50 = last["EMA50"]
+    rsi = last["RSI"]
+    macd = last["MACD"]
+    macd_signal = last["MACD_SIGNAL"]
+
+    # Простая логика — можно менять/улучшать
+    if ema20 > ema50 and rsi > 55 and macd > macd_signal:
+        return "✅ BUY"
+    if ema20 < ema50 and rsi < 45 and macd < macd_signal:
+        return "❌ SELL"
+    return "⏸ HOLD"
+
+
+# ---------- Формирование клавиатур ----------
+def keyboard_pairs():
+    keys = [[p] for p in PAIRS]
+    return ReplyKeyboardMarkup(keys, one_time_keyboard=True, resize_keyboard=True)
+
+
+def keyboard_timeframes():
+    keys = [[t] for t in TIMEFRAMES]
+    return ReplyKeyboardMarkup(keys, one_time_keyboard=True, resize_keyboard=True)
+
+
+def keyboard_after_signal():
+    return ReplyKeyboardMarkup([["🔄 Обновить сигнал", "📌 Сменить пару"]], resize_keyboard=True)
+
+
+# ---------- Хэндлеры ----------
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    user_settings[chat_id] = {"pair": None, "tf": None}
+    await update.message.reply_text("Ассаламу алейкум! 👋\nВыберите торговую пару:", reply_markup=keyboard_pairs())
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Универсальный обработчик: сначала ловим выбор пары, затем выбор TF,
+    также обрабатываем кнопки обновления и смены пары.
+    """
+    chat_id = update.effective_chat.id
+    text = (update.message.text or "").strip()
+
+    # Обработать кнопки действий
+    if text == "🔄 Обновить сигнал":
+        await refresh_signal(update, context)
+        return
+    if text == "📌 Сменить пару":
+        user_settings[chat_id] = {"pair": None, "tf": None}
+        await update.message.reply_text("Выберите торговую пару:", reply_markup=keyboard_pairs())
+        return
+
+    # Если пара не выбрана — считаем, что ввод пользователя это пара
+    settings = user_settings.get(chat_id, {"pair": None, "tf": None})
+    if not settings.get("pair"):
+        # Поддерживаем вводы в виде "BTCUSDT" или "BTC/USDT"
+        candidate = text.upper().replace(" ", "")
+        if "/" not in candidate and len(candidate) >= 6:
+            # переводим в формат ccxt 'BTC/USDT'
+            if candidate.endswith("USDT"):
+                candidate = candidate[:-4] + "/USDT"
+        if candidate not in PAIRS:
+            await update.message.reply_text("❌ Такой пары нет в списке. Выберите одну из кнопок.", reply_markup=keyboard_pairs())
+            return
+        # сохранили пару и предложили ТФ
+        user_settings[chat_id]["pair"] = candidate
+        await update.message.reply_text(f"✅ Пара выбрана: {candidate}\nТеперь выберите таймфрейм:", reply_markup=keyboard_timeframes())
+        return
+
+    # Если пара есть, но tf не выбран — считаем ввод как TF
+    if settings.get("pair") and not settings.get("tf"):
+        tf = text
+        if tf not in TIMEFRAMES:
+            await update.message.reply_text("❌ Такой таймфрейм не поддерживается. Выберите из списка.", reply_markup=keyboard_timeframes())
+            return
+        user_settings[chat_id]["tf"] = tf
+        await update.message.reply_text(f"📊 Загружаю данные для {settings['pair']} ({tf}) ...", reply_markup=ReplyKeyboardRemove())
+        await send_signal_for_user(chat_id, update, context)
+        return
+
+    # Если пара и tf уже установлены и ввели свободный текст — предложим варианты
+    await update.message.reply_text("Для обновления сигнала используйте кнопку «🔄 Обновить сигнал» или «📌 Сменить пару».",
+                                    reply_markup=keyboard_after_signal())
+
+
+async def send_signal_for_user(chat_id: int, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    settings = user_settings.get(chat_id)
+    if not settings or not settings.get("pair") or not settings.get("tf"):
+        await context.bot.send_message(chat_id, "⚠️ Сначала выберите пару и таймфрейм через /start", reply_markup=keyboard_pairs())
+        return
+
+    pair = settings["pair"]
+    tf = settings["tf"]
+
     try:
-        ohlcv = binance.fetch_ohlcv(symbol, timeframe, limit=200)
-        df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
+        df = fetch_ohlcv(pair, tf, limit=200)
+        df = calculate_indicators(df)
+        signal = decide_signal(df)
+        last_price = df["close"].iloc[-1]
 
-        # Индикаторы
-        df['EMA20'] = ta.trend.EMAIndicator(df['close'], window=20).ema_indicator()
-        df['EMA50'] = ta.trend.EMAIndicator(df['close'], window=50).ema_indicator()
-        df['EMA200'] = ta.trend.EMAIndicator(df['close'], window=200).ema_indicator()
-        df['RSI'] = ta.momentum.RSIIndicator(df['close'], window=14).rsi()
-        df['MACD'] = ta.trend.MACD(df['close']).macd()
-
-        last = df.iloc[-1]
-        price = last['close']
-
-        # Логика сигналов
-        if last['EMA20'] > last['EMA50'] and last['RSI'] > 55 and last['MACD'] > 0:
-            signal = "BUY ✅"
-        elif last['EMA20'] < last['EMA50'] and last['RSI'] < 45 and last['MACD'] < 0:
-            signal = "SELL ❌"
-        else:
-            signal = "HOLD ⏸"
-
-        return f"""
-📊 {symbol} ({timeframe})
-Цена: {price:.2f}
-➡️ Сигнал: {signal}
-
-EMA20: {last['EMA20']:.2f} | EMA50: {last['EMA50']:.2f} | EMA200: {last['EMA200']:.2f}
-RSI: {last['RSI']:.2f} | MACD: {last['MACD']:.2f}
-Объём: {last['volume']:.2f}
-"""
+        text = (
+            f"📊 {pair} ({tf})\n"
+            f"Цена: {last_price:.4f}\n\n"
+            f"EMA20: {df['EMA20'].iloc[-1]:.4f} | EMA50: {df['EMA50'].iloc[-1]:.4f} | EMA200: {df['EMA200'].iloc[-1]:.4f}\n"
+            f"RSI: {df['RSI'].iloc[-1]:.2f} | MACD: {df['MACD'].iloc[-1]:.6f} | Signal: {df['MACD_SIGNAL'].iloc[-1]:.6f}\n\n"
+            f"➡️ Сигнал: {signal}"
+        )
+        await context.bot.send_message(chat_id, text, reply_markup=keyboard_after_signal())
     except Exception as e:
-        return f"⚠️ Ошибка анализа: {str(e)}"
+        logger.exception("Ошибка при получении/анализе данных")
+        await context.bot.send_message(chat_id, f"⚠️ Ошибка при получении данных: {e}")
 
-# ========================
-# 🟢 Стартовое меню
-# ========================
-@bot.message_handler(commands=['start'])
-def start(message):
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    for pair in PAIRS:
-        markup.add(types.KeyboardButton(pair))
-    bot.send_message(message.chat.id, "👋 Привет! Выбери торговую пару:", reply_markup=markup)
 
-# ========================
-# 📌 Выбор пары
-# ========================
-@bot.message_handler(func=lambda message: message.text in PAIRS)
-def choose_pair(message):
-    user_choice[message.chat.id] = {"pair": message.text}
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=3)
-    for tf in TIMEFRAMES:
-        markup.add(types.KeyboardButton(tf))
-    markup.add("📌 Сменить пару")
-    bot.send_message(message.chat.id, f"✅ Пара {message.text} выбрана.\nТеперь выбери таймфрейм:", reply_markup=markup)
-
-# ========================
-# ⏱ Выбор таймфрейма
-# ========================
-@bot.message_handler(func=lambda message: message.text in TIMEFRAMES)
-def choose_timeframe(message):
-    chat_id = message.chat.id
-    if chat_id not in user_choice or "pair" not in user_choice[chat_id]:
-        bot.send_message(chat_id, "⚠️ Сначала выбери пару через /start")
+async def refresh_signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    settings = user_settings.get(chat_id)
+    if not settings or not settings.get("pair") or not settings.get("tf"):
+        await update.message.reply_text("⚠️ Сначала выберите пару и таймфрейм через /start", reply_markup=keyboard_pairs())
         return
+    await update.message.reply_text(f"🔄 Обновляю сигнал для {settings['pair']} ({settings['tf']}) ...")
+    await send_signal_for_user(chat_id, update, context)
 
-    user_choice[chat_id]["timeframe"] = message.text
-    pair = user_choice[chat_id]["pair"]
-    timeframe = message.text
 
-    text = analyze_symbol(pair, timeframe)
+# ---------- MAIN ----------
+def main():
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    markup.add("🔄 Обновить сигнал", "📌 Сменить пару")
+    application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    bot.send_message(chat_id, text, reply_markup=markup)
+    logger.info("Bot started")
+    application.run_polling()
 
-# ========================
-# 🔄 Обновление сигнала
-# ========================
-@bot.message_handler(func=lambda message: message.text == "🔄 Обновить сигнал")
-def refresh_signal(message):
-    chat_id = message.chat.id
-    if chat_id not in user_choice or "timeframe" not in user_choice[chat_id]:
-        bot.send_message(chat_id, "⚠️ Сначала выбери пару и таймфрейм через /start")
-        return
 
-    pair = user_choice[chat_id]["pair"]
-    timeframe = user_choice[chat_id]["timeframe"]
-
-    text = analyze_symbol(pair, timeframe)
-
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    markup.add("🔄 Обновить сигнал", "📌 Сменить пару")
-
-    bot.send_message(chat_id, text, reply_markup=markup)
-
-# ========================
-# 📌 Сменить пару
-# ========================
-@bot.message_handler(func=lambda message: message.text == "📌 Сменить пару")
-def change_pair(message):
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    for pair in PAIRS:
-        markup.add(types.KeyboardButton(pair))
-    bot.send_message(message.chat.id, "🔄 Выбери новую торговую пару:", reply_markup=markup)
-
-# ========================
-# 🚀 Запуск
-# ========================
 if __name__ == "__main__":
-    print("🤖 Bot started...")
-    bot.infinity_polling()
+    main()
