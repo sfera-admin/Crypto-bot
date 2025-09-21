@@ -1,2 +1,4 @@
-pyTelegramBotAPI==4.23.0
-requests==2.31.0
+pyTelegramBotAPI==4.12.0
+ccxt==4.2.88
+pandas==2.1.1
+ta==0.10.2
